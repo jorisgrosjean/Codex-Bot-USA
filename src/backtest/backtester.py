@@ -7,6 +7,8 @@ from typing import Dict, List, Tuple, Optional
 import pandas as pd
 import typer
 import yaml
+import json
+from pathlib import Path
 
 from src.data.provider import get_data_with_warmup, get_data
 from src.strategy.trend import generate_signals
@@ -330,6 +332,82 @@ def run_backtest(config_path: str, optimize: bool = False) -> None:
         f"  Turnover (daily avg) {_fmt_pct(activity['turnover_daily_avg'])}\n"
         f"  Best day / Worst day {_fmt_pct(activity['best_day'])} / {_fmt_pct(activity['worst_day'])}"
     )
+
+    # Save outputs to disk
+    run_cfg = cfg.get("run", {})
+    out_dir = Path(run_cfg.get("outputs_dir", "outputs/dev"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Equity with benchmarks
+    eq_index = equity.index
+    eq_df = pd.DataFrame(index=eq_index)
+    eq_df.index.name = "Date"
+    eq_df["equity"] = equity.reindex(eq_index)
+    if spy_eq is not None:
+        eq_df["spy"] = spy_eq.reindex(eq_index)
+    eq_df["buy_hold_eqw"] = bh_eq.reindex(eq_index)
+    eq_df.to_csv(out_dir / "equity.csv")
+
+    # Daily stats
+    if not daily.empty:
+        daily.to_csv(out_dir / "daily_stats.csv")
+
+    # Trade logs: detailed and compact (exit-only with PnL)
+    if not trades.empty:
+        trades.to_csv(out_dir / "tradelog_detailed.csv", index=False)
+        if "exit_reason" in trades.columns:
+            exits = trades[trades["exit_reason"].notna()].copy()
+            if not exits.empty:
+                exits["pnl"] = (exits["exit_price"].astype(float) - exits["entry_price"].astype(float)) * exits["qty"].astype(int)
+                exits["pnl_pct"] = exits["exit_price"].astype(float) / exits["entry_price"].astype(float) - 1.0
+                if "entry_date" in exits.columns and "exit_date" in exits.columns:
+                    try:
+                        exits["holding_days"] = (pd.to_datetime(exits["exit_date"]) - pd.to_datetime(exits["entry_date"])) / pd.Timedelta(days=1)
+                    except Exception:
+                        exits["holding_days"] = float("nan")
+                exits.to_csv(out_dir / "tradelog.csv", index=False)
+
+    # Save signals if requested
+    reports_cfg = cfg.get("reports", {})
+    if reports_cfg.get("save_daily_signals", False):
+        sig_rows: List[pd.DataFrame] = []
+        for t, df in signals.items():
+            df2 = df.copy()
+            if "ticker" not in df2.columns:
+                df2["ticker"] = t
+            sig_rows.append(df2)
+        if sig_rows:
+            sig_all = pd.concat(sig_rows).sort_index()
+            sig_all.to_csv(out_dir / "daily_signals.csv")
+
+    # Perf summary JSON
+    perf_summary = {
+        "Portfolio": {
+            "FinalValue": kpi_port["final"],
+            "TotalReturn": kpi_port["total_return"],
+            "CAGR": kpi_port["cagr"],
+            "Sharpe": kpi_port["sharpe"],
+            "MaxDD": _max_drawdown(equity),
+        },
+        "Benchmarks": {
+            "SPY": (_kpis_from_equity(spy_eq) if spy_eq is not None else None),
+            "B&H": _kpis_from_equity(bh_eq),
+        },
+        "Activity": activity,
+        "Meta": {
+            "period": {"start": start, "end": end},
+            "tickers": tickers,
+            "initial_capital": starting_capital,
+            "exec": {
+                "fee_pct": exec_cfg.fee_pct,
+                "slippage_pct": exec_cfg.slippage_pct,
+                "max_positions": exec_cfg.max_positions,
+                "risk_per_trade": exec_cfg.risk_per_trade,
+            },
+        },
+    }
+    with open(out_dir / "perf_summary.json", "w") as f:
+        json.dump(perf_summary, f, indent=2, default=str)
 
 
 def main():  # pragma: no cover - CLI
