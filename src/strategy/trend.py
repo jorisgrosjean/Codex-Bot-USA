@@ -75,7 +75,8 @@ def generate_signals(df_full: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFr
     if "ticker" in params:
         df_out["ticker"] = str(params["ticker"])
     df_out["atr"] = a
-    df_out["next_open_date"] = df.index.shift(-1, freq=None)
+    # Next open date: next trading row timestamp
+    df_out["next_open_date"] = df.index.to_series().shift(-1)
     df_out["next_open"] = df["Open"].shift(-1)
 
     # Drop last row (no next open) and rows where indicators are not ready
@@ -131,4 +132,3 @@ def main():  # pragma: no cover - simple CLI for demo
 
 if __name__ == "__main__":  # pragma: no cover
     main()
-
