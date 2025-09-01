@@ -28,6 +28,147 @@ def _kpis_from_equity(eq: pd.Series) -> Dict[str, float]:
     return {"final": final, "total_return": total_return, "cagr": cagr, "sharpe": sharpe}
 
 
+def _max_drawdown(eq: pd.Series) -> float:
+    eq = eq.dropna()
+    if eq.empty:
+        return math.nan
+    running_max = eq.cummax()
+    dd = eq / running_max - 1.0
+    return float(dd.min())  # negative number
+
+
+def _portfolio_activity(daily: pd.DataFrame, equity: pd.Series, trades: pd.DataFrame) -> Dict[str, object]:
+    days = len(equity)
+    # Total trades = number of exit rows
+    total_trades = int(trades[trades["exit_reason"].notna()].shape[0]) if "exit_reason" in trades.columns else 0
+    daily_avg_trades = (total_trades / days) if days > 0 else math.nan
+    max_open_positions = int(daily["positions"].max()) if "positions" in daily.columns and not daily.empty else 0
+    avg_positions = float(daily["positions"].mean()) if "positions" in daily.columns and not daily.empty else math.nan
+
+    exposure = daily["exposure_pct"] if "exposure_pct" in daily.columns and not daily.empty else pd.Series(dtype=float)
+    exposure_stats = {
+        "avg": float(exposure.mean()) if not exposure.empty else math.nan,
+        "med": float(exposure.median()) if not exposure.empty else math.nan,
+        "min": float(exposure.min()) if not exposure.empty else math.nan,
+        "max": float(exposure.max()) if not exposure.empty else math.nan,
+    }
+
+    eq = equity.sort_index()
+    ret = eq.pct_change().dropna()
+    best_day = float(ret.max()) if not ret.empty else math.nan
+    worst_day = float(ret.min()) if not ret.empty else math.nan
+
+    # Turnover: traded_value / equity_prev
+    turnover = None
+    if not daily.empty and not eq.empty:
+        daily_aligned = daily.reindex(eq.index)
+        eq_prev = eq.shift(1)
+        turn = daily_aligned["traded_value"] / eq_prev
+        turnover = float(turn.mean()) if turn.notna().any() else math.nan
+
+    return {
+        "total_trades": total_trades,
+        "daily_avg_trades": daily_avg_trades,
+        "max_open_positions": max_open_positions,
+        "avg_positions": avg_positions,
+        "exposure": exposure_stats,
+        "turnover_daily_avg": turnover if turnover is not None else math.nan,
+        "best_day": best_day,
+        "worst_day": worst_day,
+    }
+
+
+def _fmt_pct(x: float) -> str:
+    return ("{:+.2f}%".format(100 * x)) if (x == x) else "n/a"
+
+
+def _objective_score(eq: pd.Series, lam_dd: float = 3.0, dd_cap: float = 0.2) -> float:
+    k = _kpis_from_equity(eq)
+    sharpe = k.get("sharpe", math.nan)
+    dd = _max_drawdown(eq)
+    if dd != dd:  # NaN
+        dd_pen = 0.0
+    else:
+        dd_pen = max(0.0, abs(dd) - dd_cap)
+    if sharpe != sharpe:
+        return -1e9
+    return float(sharpe - lam_dd * dd_pen)
+
+
+def _optimize_trend(
+    tickers: List[str],
+    start: str,
+    end: str,
+    cache_dir: str,
+    warmup_days: int,
+    retries: int,
+    backoff: int,
+    exec_cfg_base: ExecConfig,
+    base_trend_params: Dict[str, object],
+) -> Tuple[Dict[str, object], ExecConfig, Dict[str, float]]:
+    """Very small random/grid search for TREND params and risk sizing.
+    Returns (best_trend_params, best_exec_cfg, best_kpis)
+    """
+    # Candidate grids (tiny to keep runtime small)
+    short_list = [10, 20]
+    long_list = [100]          # keep grid tiny for speed
+    mom_list = [63]
+    risk_list = [0.003, 0.005]
+    slots_list = [5]
+    sl_mult = [2.0]
+    tp_mult = [4.0]
+
+    best_score = -1e18
+    best_params = None
+    best_exec = None
+    best_kpis: Dict[str, float] = {}
+
+    # Preload data once
+    test_data: Dict[str, pd.DataFrame] = {}
+    signals_by_param: Dict[Tuple[int, int, int], Dict[str, pd.DataFrame]] = {}
+    for t in tickers:
+        df_full, df_exec = get_data_with_warmup(t, start, end, cache_dir, retries, backoff, warmup_days)
+        test_data[t] = df_exec
+        # We will compute signals per param triple lazily
+
+    # No market filter to speed up opt
+    market_data = None
+
+    for sw in short_list:
+        for lw in long_list:
+            if sw >= lw:
+                continue
+            for mw in mom_list:
+                key = (sw, lw, mw)
+                sigs: Dict[str, pd.DataFrame] = {}
+                for t in tickers:
+                    df_full, _ = get_data_with_warmup(t, start, end, cache_dir, retries, backoff, warmup_days)
+                    p = dict(base_trend_params)
+                    p.update(dict(short_window=sw, long_window=lw, momentum_window=mw, ticker=t))
+                    sigs[t] = generate_signals(df_full, p)
+                # Try exec configs
+                for risk in risk_list:
+                    for slots in slots_list:
+                        for slm in sl_mult:
+                            for tpm in tp_mult:
+                                exec_cfg = ExecConfig(**asdict(exec_cfg_base))
+                                exec_cfg.risk_per_trade = risk
+                                exec_cfg.max_positions = slots
+                                exec_cfg.stop_loss_atr_mult = slm
+                                exec_cfg.take_profit_atr_mult = tpm
+                                exec_cfg.market_filter_enabled = False  # speed up
+                                equity, trades, daily = run_test_period(test_data, sigs, exec_cfg, float(exec_cfg_base.reserve_pct * 0 + 100000))
+                                score = _objective_score(equity, lam_dd=3.0, dd_cap=0.2)
+                                if score > best_score:
+                                    best_score = score
+                                    best_params = dict(short_window=sw, long_window=lw, momentum_window=mw)
+                                    best_exec = exec_cfg
+                                    best_kpis = _kpis_from_equity(equity)
+
+    assert best_params is not None and best_exec is not None
+    return best_params, best_exec, best_kpis
+
+
 def _buy_and_hold_equal_weight(data: Dict[str, pd.DataFrame], start_capital: float) -> pd.Series:
     tickers = list(data.keys())
     if not tickers:
@@ -50,7 +191,7 @@ def _buy_and_hold_equal_weight(data: Dict[str, pd.DataFrame], start_capital: flo
     return start_capital * avg_norm
 
 
-def run_backtest(config_path: str) -> None:
+def run_backtest(config_path: str, optimize: bool = False) -> None:
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
 
@@ -104,6 +245,22 @@ def run_backtest(config_path: str) -> None:
         # sensible defaults
         trend_params = dict(short_window=20, long_window=100, momentum_window=63, atr_lookback=14)
 
+    # Optionally optimize
+    if optimize:
+        best_trend, best_exec, best_kpi = _optimize_trend(
+            tickers, start, end, cache_dir, warmup_days, retries, backoff, exec_cfg, trend_params
+        )
+        print("[opt] Best TREND params:", best_trend)
+        print("[opt] Updated Exec:", {
+            "risk_per_trade": best_exec.risk_per_trade,
+            "max_positions": best_exec.max_positions,
+            "stop_loss_atr_mult": best_exec.stop_loss_atr_mult,
+            "take_profit_atr_mult": best_exec.take_profit_atr_mult,
+            "market_filter_enabled": best_exec.market_filter_enabled,
+        })
+        trend_params.update(best_trend)
+        exec_cfg = best_exec
+
     # Load data and build signals
     test_data: Dict[str, pd.DataFrame] = {}
     signals: Dict[str, pd.DataFrame] = {}
@@ -154,30 +311,39 @@ def run_backtest(config_path: str) -> None:
     kpi_port = _kpis_from_equity(equity)
     kpi_spy = _kpis_from_equity(spy_eq) if spy_eq is not None else {"final": math.nan, "total_return": math.nan, "cagr": math.nan, "sharpe": math.nan}
     kpi_bh = _kpis_from_equity(bh_eq)
-
-    def fmt_pct(x: float) -> str:
-        return ("{:+.2f}%".format(100 * x)) if (x == x) else "n/a"  # NaN check via x==x
+    activity = _portfolio_activity(daily, equity, trades)
 
     print("=== Backtest Summary (TREND) ===")
     print(f"Period: {start} → {end} | Tickers: {', '.join(tickers)} | StartCap: {starting_capital:,.0f}")
     print("Portfolio:")
-    print(f"  Final: {kpi_port['final']:,.2f} | Total Return: {fmt_pct(kpi_port['total_return'])} | CAGR: {fmt_pct(kpi_port['cagr'])} | Sharpe: {kpi_port['sharpe']:.2f}")
+    print(f"  Final: {kpi_port['final']:,.2f} | Total Return: {_fmt_pct(kpi_port['total_return'])} | CAGR: {_fmt_pct(kpi_port['cagr'])} | Sharpe: {kpi_port['sharpe']:.2f}")
     print("Benchmark SPY:")
-    print(f"  Final: {kpi_spy['final']:,.2f} | Total Return: {fmt_pct(kpi_spy['total_return'])} | CAGR: {fmt_pct(kpi_spy['cagr'])} | Sharpe: {kpi_spy['sharpe']:.2f}")
+    print(f"  Final: {kpi_spy['final']:,.2f} | Total Return: {_fmt_pct(kpi_spy['total_return'])} | CAGR: {_fmt_pct(kpi_spy['cagr'])} | Sharpe: {kpi_spy['sharpe']:.2f}")
     print("Buy & Hold Equal-Weight (universe):")
-    print(f"  Final: {kpi_bh['final']:,.2f} | Total Return: {fmt_pct(kpi_bh['total_return'])} | CAGR: {fmt_pct(kpi_bh['cagr'])} | Sharpe: {kpi_bh['sharpe']:.2f}")
+    print(f"  Final: {kpi_bh['final']:,.2f} | Total Return: {_fmt_pct(kpi_bh['total_return'])} | CAGR: {_fmt_pct(kpi_bh['cagr'])} | Sharpe: {kpi_bh['sharpe']:.2f}")
+    print("Portfolio Activity:")
+    print(
+        f"  Total / Daily Avg trades {activity['total_trades']} / {activity['daily_avg_trades']:.2f}\n"
+        f"  Max open positions {activity['max_open_positions']}\n"
+        f"  Avg # positions {activity['avg_positions']:.3f}\n"
+        f"  Exposure avg/med/min/max {_fmt_pct(activity['exposure']['avg'])} / {_fmt_pct(activity['exposure']['med'])} / {_fmt_pct(activity['exposure']['min'])} / {_fmt_pct(activity['exposure']['max'])}\n"
+        f"  Turnover (daily avg) {_fmt_pct(activity['turnover_daily_avg'])}\n"
+        f"  Best day / Worst day {_fmt_pct(activity['best_day'])} / {_fmt_pct(activity['worst_day'])}"
+    )
 
 
 def main():  # pragma: no cover - CLI
     app = typer.Typer(add_completion=False, no_args_is_help=True)
 
     @app.command()
-    def run(config: str = typer.Option("config/backtest.yml", help="Path to YAML config")):
-        run_backtest(config)
+    def run(
+        config: str = typer.Option("config/backtest.yml", help="Path to YAML config"),
+        optimize: bool = typer.Option(False, help="Run quick param optimization before backtest"),
+    ):
+        run_backtest(config, optimize)
 
     app()
 
 
 if __name__ == "__main__":  # pragma: no cover
     main()
-
