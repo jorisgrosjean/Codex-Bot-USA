@@ -6,7 +6,14 @@ run:
   outputs_dir: "outputs/dev"
 
 universe:
-  tickers: [AAPL, MSFT, NVDA, AMZN, META]
+  tickers: [
+    JNJ, MRK, PFE, ABT,
+    PG, KO, PEP, WMT,
+    JPM, BAC, WFC, GS,
+    XOM, CVX,
+    DUK, SO,
+    ORCL, CSCO, IBM, INTC
+  ]
   benchmarks: [SPY, QQQ]
   # Buy & Hold equal-weight is derived from the fixed universe above
   start: "2012-01-01"   # adjust as needed
@@ -24,14 +31,14 @@ execution:
   initial_capital: 100000
   fee_pct: 0.0005          # 0.05% per trade side
   slippage_pct: 0.0005     # 0.05% slippage
-  max_positions: 5
+  max_positions: 8
   reserve_pct: 0.05
   notional_cap_per_name: 0.15
   leverage_cap: 1.0
 
   # Stops & sizing
   atr_lookback: 14
-  risk_per_trade: 0.003     # 0.3% of NAV (robust default)
+  risk_per_trade: 0.004     # slightly higher to capture more edge
   trailing: true
   time_stop_days: 40
   holding_min_days: 3

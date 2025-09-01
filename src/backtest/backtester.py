@@ -234,6 +234,7 @@ def run_backtest(config_path: str, optimize: bool = False) -> None:
         market_filter_enabled=bool(exec_raw.get("market_filter", {}).get("enabled", True)),
         market_filter_spy_ma_days=int(exec_raw.get("market_filter", {}).get("params", {}).get("spy_ma_days", 200)),
         market_filter_vix_threshold=float(exec_raw.get("market_filter", {}).get("params", {}).get("vix_threshold", 30)),
+        dd_brakes=exec_raw.get("dd_brakes"),
     )
 
     starting_capital = float(exec_raw.get("initial_capital", 100000))

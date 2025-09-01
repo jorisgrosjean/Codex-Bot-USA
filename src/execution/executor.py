@@ -37,6 +37,8 @@ class ExecConfig:
     market_filter_enabled: bool = True
     market_filter_spy_ma_days: int = 200
     market_filter_vix_threshold: float = 30.0
+    # Drawdown brakes: list of dicts like {dd: 0.10, risk_scale: 0.5, slots_scale: 0.75}
+    dd_brakes: Optional[List[Dict[str, float]]] = None
 
 
 def _union_dates(dfs: Dict[str, pd.DataFrame]) -> List[pd.Timestamp]:
@@ -210,6 +212,29 @@ def run_test_period(
                 vix_ok = True
             allow_new_entries = bool(spy_ok and vix_ok)
 
+        # 2b) Risk scaling via drawdown brakes and target volatility
+        current_max_positions = exec_cfg.max_positions
+        effective_risk_per_trade = exec_cfg.risk_per_trade
+        # Drawdown brakes
+        if exec_cfg.dd_brakes and equity_track:
+            last_equity = equity_track[-1][1]
+            current_dd = (last_equity / max_equity) - 1.0
+            # apply most severe brake for which abs(dd) >= threshold
+            applicable = [b for b in exec_cfg.dd_brakes if abs(current_dd) >= float(b.get("dd", 0.0))]
+            if applicable:
+                # pick the one with largest dd
+                chosen = sorted(applicable, key=lambda x: x.get("dd", 0.0), reverse=True)[0]
+                rs = float(chosen.get("risk_scale", 1.0))
+                ss = float(chosen.get("slots_scale", 1.0))
+                effective_risk_per_trade *= rs
+                current_max_positions = max(0, int(round(current_max_positions * ss)))
+        # Vol targeting reduce-only
+        if exec_cfg.vol_target_annual and equity_track:
+            vol = _realized_vol_annualized(equity_track, window=20)
+            if vol and vol > 0:
+                scale = min(1.0, float(exec_cfg.vol_target_annual) / vol)
+                effective_risk_per_trade *= scale
+
         # 3) New entries
         if allow_new_entries:
             # Collect today's buy signals
@@ -232,9 +257,8 @@ def run_test_period(
             # sort by score desc
             candidates.sort(key=lambda x: x[1], reverse=True)
 
-            # current constraints (drawdown brakes could scale these; omitted here for brevity)
-            current_max_positions = exec_cfg.max_positions
-            risk_per_trade = exec_cfg.risk_per_trade
+            # current constraints (scaled by brakes/vol targeting)
+            risk_per_trade = effective_risk_per_trade
 
             for tkr, score, entry_price, atr_val, next_open_date in candidates:
                 # slots check
@@ -259,7 +283,7 @@ def run_test_period(
                     take_profit_atr_mult=exec_cfg.take_profit_atr_mult,
                 )
                 qty = compute_risk_qty(
-                    equity=max(cash, 1e-9) + 0.0,  # approximate using cash; improved by using equity later
+                    equity=(equity_track[-1][1] if equity_track else starting_capital),
                     risk_per_trade=risk_per_trade,
                     stop_distance=stop_distance,
                 )
@@ -363,4 +387,3 @@ def run_test_period(
     tradelog_detailed = pd.DataFrame(trade_rows)
     daily_stats = pd.DataFrame(daily_rows).set_index("date").sort_index()
     return equity_series, tradelog_detailed, daily_stats
-
