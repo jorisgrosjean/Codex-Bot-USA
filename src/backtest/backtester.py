@@ -11,7 +11,9 @@ import json
 from pathlib import Path
 
 from src.data.provider import get_data_with_warmup, get_data
-from src.strategy.trend import generate_signals
+from src.strategy.trend import generate_signals as trend_signals
+from src.strategy.meanrev import generate_signals as meanrev_signals
+from src.strategy.breakout import generate_signals as breakout_signals
 from src.execution.executor import run_test_period, ExecConfig
 
 
@@ -236,21 +238,21 @@ def run_backtest(config_path: str, optimize: bool = False) -> None:
 
     starting_capital = float(exec_raw.get("initial_capital", 100000))
 
-    # Strategy params (TREND only for now)
+    # Strategy params (multi-strategy support)
     strat_cfg = cfg.get("strategies", {})
-    trend_params = None
-    for item in strat_cfg.get("mix", []):
-        if item.get("name") == "TREND":
-            trend_params = item.get("params", {})
-            break
-    if trend_params is None:
-        # sensible defaults
-        trend_params = dict(short_window=20, long_window=100, momentum_window=63, atr_lookback=14)
+    strat_mix = strat_cfg.get("mix", [])
+    if not strat_mix:
+        strat_mix = [
+            {"name": "TREND", "weight": 1.0, "params": {"short_window": 20, "long_window": 100, "momentum_window": 63, "atr_lookback": 14}},
+        ]
+    combiner = strat_cfg.get("combine", "rank").lower()
 
     # Optionally optimize
+    # Optional optimization (TREND-only quick tuning)
     if optimize:
         best_trend, best_exec, best_kpi = _optimize_trend(
-            tickers, start, end, cache_dir, warmup_days, retries, backoff, exec_cfg, trend_params
+            tickers, start, end, cache_dir, warmup_days, retries, backoff, exec_cfg,
+            next((m.get("params", {}) for m in strat_mix if m.get("name") == "TREND"), {})
         )
         print("[opt] Best TREND params:", best_trend)
         print("[opt] Updated Exec:", {
@@ -260,24 +262,150 @@ def run_backtest(config_path: str, optimize: bool = False) -> None:
             "take_profit_atr_mult": best_exec.take_profit_atr_mult,
             "market_filter_enabled": best_exec.market_filter_enabled,
         })
-        trend_params.update(best_trend)
+        # Update TREND params in mixer
+        for m in strat_mix:
+            if m.get("name") == "TREND":
+                m["params"] = {**m.get("params", {}), **best_trend}
         exec_cfg = best_exec
 
-    # Load data and build signals
+    # Load data (full + exec) for all tickers
     test_data: Dict[str, pd.DataFrame] = {}
-    signals: Dict[str, pd.DataFrame] = {}
-
+    full_data: Dict[str, pd.DataFrame] = {}
     for t in tickers:
         df_full, df_exec = get_data_with_warmup(
             t, start=start, end=end, cache_dir=cache_dir, retries=retries, retry_backoff_sec=backoff, warmup_days=warmup_days
         )
-        p = dict(trend_params)
-        p["ticker"] = t
-        sig = generate_signals(df_full, p)
-        # Keep only execution window intersection with df_exec
-        sig = sig.loc[sig.index.intersection(df_exec.index)]
+        full_data[t] = df_full
         test_data[t] = df_exec
-        signals[t] = sig
+
+    # Build per-strategy signals
+    strat_generators = {
+        "trend": trend_signals,
+        "meanrev": meanrev_signals,
+        "breakout": breakout_signals,
+    }
+
+    per_strat_signals: Dict[str, Dict[str, pd.DataFrame]] = {}
+    for mix in strat_mix:
+        name = mix.get("name").lower()
+        gen = strat_generators.get(name)
+        if gen is None:
+            continue
+        per_strat_signals[name] = {}
+        for t in tickers:
+            params = {**mix.get("params", {}), "ticker": t}
+            sig = gen(full_data[t], params)
+            sig = sig.loc[sig.index.intersection(test_data[t].index)]
+            per_strat_signals[name][t] = sig
+
+    # Combine strategies into unified per-ticker signals
+    signals: Dict[str, pd.DataFrame] = {}
+    if combiner == "weighted":
+        # Sum weighted scores when buy=1 from any strategy
+        weight_map = {m.get("name").lower(): float(m.get("weight", 1.0)) for m in strat_mix}
+        for t in tickers:
+            idx = test_data[t].index
+            out = pd.DataFrame(index=idx)
+            out["buy"] = 0
+            out["sell"] = 0
+            out["score"] = 0.0
+            for sname, sigs in per_strat_signals.items():
+                if t not in sigs:
+                    continue
+                s = sigs[t]
+                w = weight_map.get(sname, 1.0)
+                s_buy = s["buy"].reindex(idx).fillna(0).astype(int)
+                s_sell = s.get("sell", pd.Series(0, index=idx)).reindex(idx).fillna(0).astype(int)
+                s_score = s["score"].reindex(idx).fillna(0.0)
+                out["buy"] = ((out["buy"] == 1) | (s_buy == 1)).astype(int)
+                out["sell"] = ((out["sell"] == 1) | (s_sell == 1)).astype(int)
+                out["score"] += w * s_score
+            # Execution helpers
+            df_exec = test_data[t]
+            out["ticker"] = t
+            out["next_open_date"] = df_exec.index.to_series().shift(-1)
+            out["next_open"] = df_exec["Open"].shift(-1)
+            # Prefer ATR from TREND if available else compute from df_full here skipped for speed
+            # Just reindex ATR from the first available strategy that provides it
+            atr_series = None
+            for sigs in per_strat_signals.values():
+                if t in sigs and "atr" in sigs[t].columns:
+                    atr_series = sigs[t]["atr"].reindex(idx)
+                    break
+            out["atr"] = atr_series
+            ready = out["next_open"].notna()
+            signals[t] = out.loc[ready]
+    else:  # combiner == 'rank'
+        # Build a long table of candidates per strategy
+        import numpy as np
+        weight_map = {m.get("name").lower(): float(m.get("weight", 1.0)) for m in strat_mix}
+        rows = []
+        for sname, tdict in per_strat_signals.items():
+            w = weight_map.get(sname, 1.0)
+            for t, s in tdict.items():
+                df = s[s["buy"] == 1][["score"]].copy()
+                if df.empty:
+                    continue
+                df["ticker"] = t
+                df["strategy"] = sname
+                rows.append(df)
+        if rows:
+            long_df = pd.concat(rows)
+            # Rank by date and strategy across tickers
+            long_df["date"] = long_df.index
+            long_df["rank"] = long_df.groupby(["date", "strategy"])['score'].rank(ascending=False, method='average')
+            # Compute N per group to normalize
+            counts = long_df.groupby(["date", "strategy"])['score'].transform('count')
+            long_df["norm"] = (counts - long_df["rank"] + 1) / counts
+            # Weighted score per date,ticker
+            long_df["weight"] = long_df["strategy"].map(weight_map)
+            long_df["wscore"] = long_df["norm"] * long_df["weight"]
+            combined = long_df.groupby(["date", "ticker"])['wscore'].sum().reset_index()
+        else:
+            combined = pd.DataFrame(columns=["date", "ticker", "wscore"]).astype({"wscore": float})
+
+        # Build per-ticker signals
+        for t in tickers:
+            idx = test_data[t].index
+            out = pd.DataFrame(index=idx)
+            out["buy"] = 0
+            out["sell"] = 0
+            out["score"] = 0.0
+            # buys from combined table
+            sub = combined[combined["ticker"] == t]
+            if not sub.empty:
+                s2 = pd.Series(sub.set_index("date")["wscore"])
+                s2 = s2.reindex(idx).fillna(0.0)
+                out.loc[s2 > 0, "buy"] = 1
+                out["score"] = s2
+            # sells: union across strategies
+            sell_union = None
+            for sname, tdict in per_strat_signals.items():
+                s = tdict.get(t)
+                if s is None:
+                    continue
+                s_sell = s.get("sell")
+                if s_sell is None:
+                    continue
+                s_sell = s_sell.reindex(idx).fillna(0).astype(int)
+                sell_union = s_sell if sell_union is None else ((sell_union == 1) | (s_sell == 1)).astype(int)
+            if sell_union is not None:
+                out["sell"] = sell_union
+            # Execution helpers
+            df_exec = test_data[t]
+            out["ticker"] = t
+            out["next_open_date"] = df_exec.index.to_series().shift(-1)
+            out["next_open"] = df_exec["Open"].shift(-1)
+            # ATR pick from any strategy provided
+            atr_series = None
+            for tdict in per_strat_signals.values():
+                s = tdict.get(t)
+                if s is not None and "atr" in s.columns:
+                    atr_series = s["atr"].reindex(idx)
+                    break
+            out["atr"] = atr_series
+            ready = out["next_open"].notna()
+            signals[t] = out.loc[ready]
 
     # Market data for filter
     market_data: Dict[str, pd.DataFrame] = {}
