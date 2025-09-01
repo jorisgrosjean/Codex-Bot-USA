@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Virtual env
+.venv/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Data & outputs
+cache/
+outputs/
+*.parquet
+
+# Logs
+*.log

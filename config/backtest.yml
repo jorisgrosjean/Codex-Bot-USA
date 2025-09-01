@@ -1,0 +1,112 @@
+# Backtest/WFA configuration (Phase 0 baseline)
+
+run:
+  name: "dev_run_v1"
+  seed: 42
+  outputs_dir: "outputs/dev"
+
+universe:
+  tickers: [AAPL, MSFT, NVDA, AMZN, META]
+  benchmarks: [SPY, QQQ]
+  # Buy & Hold equal-weight is derived from the fixed universe above
+  start: "2012-01-01"   # adjust as needed
+  end: "2024-12-31"     # adjust as needed
+
+data:
+  provider: "yahoo"
+  cache_dir: "cache"
+  warmup_days: 252
+  retries: 3
+  retry_backoff_sec: 2
+  trading_calendar: "XNYS"
+
+execution:
+  initial_capital: 100000
+  fee_pct: 0.0005          # 0.05% per trade side
+  slippage_pct: 0.0005     # 0.05% slippage
+  max_positions: 5
+  reserve_pct: 0.05
+  notional_cap_per_name: 0.15
+  leverage_cap: 1.0
+
+  # Stops & sizing
+  atr_lookback: 14
+  risk_per_trade: 0.003     # 0.3% of NAV (robust default)
+  trailing: true
+  time_stop_days: 40
+  holding_min_days: 3
+  cooldown_days: 3
+  stop_first: true          # if SL and TP both touched intraday
+  min_price: 5.0
+  adv_cap_pct: null         # e.g., 0.05 to cap at 5% of ADV; null to disable
+
+  # Drawdown brakes: reduce risk and slots as DD deepens
+  dd_brakes:
+    - {dd: 0.10, risk_scale: 0.5,  slots_scale: 0.75}
+    - {dd: 0.15, risk_scale: 0.25, slots_scale: 0.50}
+    - {dd: 0.20, risk_scale: 0.0,  slots_scale: 0.0}   # freeze new entries
+
+  # Volatility targeting (reduce-only)
+  vol_target_annual: 0.18   # align with 18–20% target, reduce-only
+
+  # Market filter (simple regime)
+  market_filter:
+    enabled: true
+    type: "risk_regime"
+    params:
+      spy_ma_days: 200
+      vix_threshold: 30
+
+strategies:
+  combine: "rank"         # robust across assets; alternative: "weighted"
+  mix:
+    - name: "TREND"
+      weight: 1.0
+      params:
+        short_window: 20
+        long_window: 100
+        momentum_window: 63
+        stop_loss_atr: 2.0
+        take_profit_atr: 4.0
+        trailing: true
+        time_stop_days: 40
+    - name: "MEANREV"
+      weight: 0.6
+      params:
+        rsi_length: 14
+        rsi_buy: 30
+        z_len: 5
+        time_stop_days: 10
+    - name: "BREAKOUT"
+      weight: 0.8
+      params:
+        donchian: 55
+        stop_loss_atr: 2.5
+        take_profit_atr: 5.0
+        trailing: true
+        time_stop_days: 60
+
+backtest:
+  mode: "wfa"             # "simple" or "wfa"
+  wfa:
+    train_months: 24
+    test_months: 6
+    step_months: 6
+    per_ticker_optimization: true
+    optimizer:
+      method: "random"     # "grid" or "random"
+      n_candidates: 20
+      min_trades_train: 5
+      objective:
+        name: "sharpe_dd"
+        lambda_dd: 3.0
+        dd_cap: 0.20
+    parallel:
+      enabled: true
+      n_jobs: 4
+
+reports:
+  generate_html: true
+  generate_plots: true
+  save_daily_signals: true
+  save_window_opt_results: true
